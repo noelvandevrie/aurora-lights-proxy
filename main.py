@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import socket
 import threading
 import traceback
@@ -43,8 +44,6 @@ mqtt_port = int(os.environ.get('MQTT_PORT', '8883' if mqtt_tls else '1883'))
 
 # Stop thread when necessary
 running = True
-# SocketIO exception
-crashed = False
 def stop_execution(signum, frame):
     global running
     running = False
@@ -53,6 +52,13 @@ def stop_execution(signum, frame):
 # When receiving an EXIT signal, try to stop the execution flow
 signal.signal(signal.SIGINT, stop_execution)
 signal.signal(signal.SIGTERM, stop_execution)
+
+sio = socketio.Client(logger=True)
+
+status_thread = None
+status_thread_running = False
+start_time = 0
+latency_ms = 0
 
 # The latest frame from Aurora (None while Aurora is not connected), picked up by the sender thread
 latest_frame = None
@@ -68,7 +74,11 @@ last_beat_channel = None
 last_log = time.monotonic()
 packets_since = 0
 frames_since = 0
+auth_cookie = ''
 
+def get_headers():
+    global auth_cookie
+    return {'cookie': 'connect.sid=' + auth_cookie}
 
 def parse_array(arr, desired_length):
     int_arr = [max(min(int(x), 255), 0) for x in arr]
@@ -200,11 +210,48 @@ mqtt_client.on_connect_fail = on_connect_fail
 mqtt_client.on_disconnect = on_disconnect
 mqtt_client.on_socket_open = on_socket_open
 
+def send_status_updates():
+    global status_thread_running, sio, latency_ms
 
-def main_thread():
-    global running, crashed
+    while status_thread_running:
+        uptime_seconds = int(time.time() - start_time)
+        system_timestamp = math.floor(time.time_ns() / 1000000)
+        last_send_time = system_timestamp
 
-    crashed = False
+        def status_update_callback():
+            global latency_ms
+            callback_time = time.time_ns() / 1000000
+            rtt = callback_time - last_send_time
+            latency_ms = int(rtt / 2)
+            logging.info(f"Latency: {latency_ms} ms")
+
+        sio.emit('status:update', {
+            'uptimeSeconds': uptime_seconds,
+            'systemTimestamp': system_timestamp,
+            'latencyMilliseconds': latency_ms,
+        }, callback=status_update_callback)
+
+        time.sleep(5)
+
+def create_status_loop():
+    global status_thread, status_thread_running
+    status_thread_running = True
+    status_thread = threading.Thread(target=send_status_updates)
+    status_thread.daemon = True
+    status_thread.start()
+
+def stop_status_loop():
+    global status_thread, status_thread_running
+    if status_thread is None:
+        return
+    status_thread_running = False
+    status_thread.join(timeout=1.0)
+    status_thread = None
+
+def main():
+    global sio, running, start_time, auth_cookie
+
+    start_time = time.time()
 
     url = os.environ['URL'] + '/api/auth/key'
     result = requests.post(url, {'key': os.environ['API_KEY']})
@@ -216,67 +263,64 @@ def main_thread():
             body['details'] if body['details'] else body['message']),
         )
 
-    cookie = result.cookies.get('connect.sid')
+    auth_cookie = result.cookies.get('connect.sid')
 
-    sio = socketio.Client()
+    # Initialize SocketIO
+    sio.connect(os.environ['URL'], headers=get_headers, namespaces=['/', '/lights'])
 
-    @sio.event(namespace='/lights')
-    @sio.event(namespace='/')
-    def dmx_packet(packet):
-        global packets_since, frames_since, last_log
+    logging.info('Connected')
 
-        set_frame(build_frame(parse_array(packet, packet_size)))
-        packets_since = packets_since + 1
+    while running:
+        time.sleep(0.5)
 
-        # Logging/debugging time
-        now = time.monotonic()
-        if now - last_log > 1:
-            logging.debug(f"Received {packets_since:02} DMX packets, sent {frames_since:02} frames since last log "
-                          f"(last frame: {latest_frame.hex() if latest_frame else None})")
-
-            # Reset logging variables
-            packets_since = 0
-            frames_since = 0
-            last_log = now
-
-    @sio.event(namespace='/')
-    @sio.event(namespace='/lights')
-    def disconnect(*args):
-        global crashed
-        crashed = True
-
-    sio.connect(os.environ['URL'], headers={'cookie': 'connect.sid=' + cookie},
-                namespaces=['/', '/lights'])
-    set_aurora_connected(True)
-    logging.info('Start listening...')
-
-    while running and not crashed:
-        time.sleep(1)
-
-    set_aurora_connected(False)
     sio.disconnect()
-    if crashed and running:
-        raise Exception('Socket disconnect')
 
+@sio.event(namespace='/lights')
+def dmx_packet(packet):
+    global packets_since, frames_since, last_log
 
-mqtt_client.connect_async(mqtt_host, mqtt_port, keepalive=15)
-mqtt_client.loop_start()
-threading.Thread(target=send_frames, daemon=True).start()
+    set_frame(build_frame(parse_array(packet, packet_size)))
+    packets_since = packets_since + 1
 
-while running:
-    try:
-        logging.info('Connecting...')
-        main_thread()
-    except Exception as e:
-        set_aurora_connected(False)
-        logging.error(traceback.format_exc())
-        logging.info('Something went wrong. Try again...')
-        for _ in range(5):
-            if running:
-                time.sleep(1)
+    # Logging/debugging time
+    now = time.monotonic()
+    if now - last_log > 1:
+        logging.debug(f"Received {packets_since:02} DMX packets, sent {frames_since:02} frames since last log "
+                      f"(last frame: {latest_frame.hex() if latest_frame else None})")
 
-# Clean shutdown: tell the website the bridge is gone, the LWT only covers a lost connection
-if mqtt_client.is_connected():
-    mqtt_client.publish(topic_status, json.dumps({'online': False}), qos=0, retain=True).wait_for_publish(2)
-mqtt_client.disconnect()
-mqtt_client.loop_stop()
+        # Reset logging variables
+        packets_since = 0
+        frames_since = 0
+        last_log = now
+
+@sio.event
+def disconnect():
+    set_aurora_connected(False)
+    stop_status_loop()
+
+@sio.event
+def connect():
+    set_aurora_connected(True)
+    create_status_loop()
+
+if __name__ == '__main__':
+    mqtt_client.connect_async(mqtt_host, mqtt_port, keepalive=15)
+    mqtt_client.loop_start()
+    threading.Thread(target=send_frames, daemon=True).start()
+
+    while running:
+        try:
+            main()
+        except Exception as e:
+            set_aurora_connected(False)
+            logging.error(traceback.format_exc())
+            logging.info('Something went wrong. Retrying in 5 seconds...')
+            for _ in range(5):
+                if running:
+                    time.sleep(1)
+
+    # Clean shutdown: tell the website the bridge is gone, the LWT only covers a lost connection
+    if mqtt_client.is_connected():
+        mqtt_client.publish(topic_status, json.dumps({'online': False}), qos=0, retain=True).wait_for_publish(2)
+    mqtt_client.disconnect()
+    mqtt_client.loop_stop()
