@@ -1,0 +1,26 @@
+# Runs next to the logo's deploy/ stack and reaches its broker as `mosquitto` on that stack's network.
+#
+#   cp .env.example .env   # fill in; MQTT_HOST=mosquitto, MQTT_PASSWORD is the logo's MQTT_BRIDGE_PASSWORD
+#   docker compose up -d --build
+
+name: aurora-proxy
+
+services:
+  proxy:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Gives python the time to publish the offline status after SIGTERM (it waits up to 2 s).
+    stop_grace_period: 5s
+    logging:
+      # The Socket.IO client logs every DMX packet; keep the log from filling the disk.
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - boom-logo
+
+networks:
+  boom-logo:
+    name: boom-logo_default
+    external: true
