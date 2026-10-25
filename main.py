@@ -28,6 +28,7 @@ tree_fixture = 4                    # the tree's fixture; the name's fixtures ar
 tree_segments = 3                   # the tree fixture's colour goes to crown, trunk and roots
 min_frame_interval = 1 / 40         # at most ~40 frames per second
 resend_interval = 1.0               # the logo falls back to its scene after 5 s without frames
+aurora_timeout = 15 * 60.0          # stop sending when Aurora sends no DMX packets this long (stuck Aurora)
 topic_live = 'boom-logo/live'
 topic_status = 'boom-logo/bridge/status'
 # End global settings
@@ -62,6 +63,7 @@ latency_ms = 0
 
 # The latest frame from Aurora (None while Aurora is not connected), picked up by the sender thread
 latest_frame = None
+latest_frame_at = 0.0
 frame_lock = threading.Lock()
 frame_changed = threading.Event()
 aurora_connected = False
@@ -120,17 +122,18 @@ def format_channels(channels):
 
 
 def set_frame(frame):
-    global latest_frame
+    global latest_frame, latest_frame_at
     with frame_lock:
         changed = frame != latest_frame
         latest_frame = frame
+        latest_frame_at = time.monotonic()
     if changed:
         frame_changed.set()
 
 
 def send_frames():
     """Publish frames when they change, at most ~40 per second, and resend the last one every second."""
-    global frames_since
+    global frames_since, latest_frame
     sent = None
     sent_at = 0.0
     resend_at = 0.0
@@ -142,6 +145,10 @@ def send_frames():
         if wait > 0:
             time.sleep(wait)
         with frame_lock:
+            # Resending a frozen frame forever would freeze the logo; stop, so it falls back to its scene
+            if latest_frame is not None and time.monotonic() - latest_frame_at > aurora_timeout:
+                logging.warning(f"No DMX packets from Aurora for {aurora_timeout / 60:.0f} min, stopping frames")
+                latest_frame = None
             frame = latest_frame
         if frame is None or not mqtt_client.is_connected():
             resend_at = time.monotonic() + resend_interval

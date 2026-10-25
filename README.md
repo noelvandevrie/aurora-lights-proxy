@@ -31,4 +31,5 @@ Fixture n is at x = n−1: 1 B, 2 dot1, 3 O1, 4 dot2, 5 tree, 6 O2, 7 dot3, 8 M,
 `DMX_START_ADDRESS` (default 1), so fixture n is on channels 6n−5…6n.
 
 The script sends a frame only when it changes, at most ~40 per second, and resends the last one every second. When
-Aurora disconnects it stops sending, and the logo falls back to its scene after 5 seconds.
+Aurora disconnects, or sends no DMX packets for 15 minutes, it stops sending, and the logo falls back to its scene
+after 5 seconds. Frames start again with the next DMX packet.
