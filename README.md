@@ -1,23 +1,30 @@
-# Aurora Lights Proxy
+# Aurora Lights Proxy (B.O.O.M. logo)
 
-This script is a simple proxy to forward DMX packets from the [Aurora core](https://github.com/gewis/narrowcasting-core)
-to an ArtNet controller. Because the ArtNet controller cannot be connected to a general network, a computer will act as
-a proxy. This script will connect to the SocketIO server and listens for DMX packets. Once it receives such a packet, it
-makes sure it has the right amount of channels and forwards it to the ArtNet controller.
+This script forwards DMX packets from the [Aurora core](https://github.com/gewis/narrowcasting-core) to the B.O.O.M.
+LED logo over MQTT. It connects to the SocketIO server and listens for DMX packets, turns the logo's channels into
+live frames and publishes them on `boom-logo/live`. It also publishes its own status on `boom-logo/bridge/status`, so
+the logo's website can show whether Aurora is connected.
+
+The frame format and the rules for sending them are in the "Live source (Aurora)" section of `protocol/PROTOCOL.md`
+in the logo repository.
 
 ## Prerequisites
-- Python 3.11.
-- An Artnet controller, for example the Showtec NET-2/3 Pocket. The IP should be set to `169.254.0.2`. If you change
-this, make sure you also change it in `main.py`.
+- Python 3.9 or newer.
+- The logo's MQTT broker, and the password of its `bridge` user.
 
 ## Installation
 - Create a virtual environment `python -m venv venv`.
 - Activate the virtual environment `./venv/Scripts/activate.bat` or `./venv/Scripts/activate`.
 - Install requirements `pip install -r requirements.txt`.
-- Copy `.env.example` to `.env` and set the URL and API Key.
+- Copy `.env.example` to `.env` and set the Aurora URL and API key, and the MQTT broker and password.
 - Start the script `python main.py`.
 
-When you start the script, make sure the Artnet controller is connected to the host machine. Otherwise, you might get
-a lot of socket connection errors. Note that these are probably from the connection to the Artnet controller and not
-from the connection with the core. In `main.py`, some more global settings can be found. These settings are tailored
-to the situation of GEWIS (with a Showtec NET-2/3 Pocket), but feel free to change these variables to your own needs.
+## Patching in Aurora
+Patch the logo as 9 RGB fixtures with 6 channels each: R, G, B, (unused), dimmer, strobe. Fixtures 1–8 are the
+letters and dots (B, dot1, O1, dot2, O2, dot3, M, dot4), fixture 9 is the whole tree (crown, trunk and roots). They
+start at `DMX_START_ADDRESS` (default 1), so fixture n is on channels 6n−5…6n. Optionally patch the logo control
+fixture right after them (channels 55–58 with start address 1: strobe variant, beat, texture, hit) and set
+`CONTROL_FIXTURE=true`.
+
+The script sends a frame only when it changes, at most ~40 per second, and resends the last one every second. When
+Aurora disconnects it stops sending, and the logo falls back to its scene after 5 seconds.
