@@ -22,9 +22,10 @@ logging.basicConfig(
 
 # Global settings, see the "Live source (Aurora)" section of the logo's PROTOCOL.md
 packet_size = 512                   # one DMX universe
-fixture_count = 9                   # B .. dot4, then the tree (crown + trunk + roots) as one fixture
+fixture_count = 9                   # a 9×2 grid: B .. dot4 on row 0 (x0–x8), the tree on row 1 at x4
 fixture_channels = 6                # R, G, B, (unused), dimmer, strobe
-tree_segments = 3                   # the last fixture's colour goes to crown, trunk and roots
+tree_fixture = 4                    # the tree's fixture; the name's fixtures are the others, in order
+tree_segments = 3                   # the tree fixture's colour goes to crown, trunk and roots
 min_frame_interval = 1 / 40         # at most ~40 frames per second
 resend_interval = 1.0               # the logo falls back to its scene after 5 s without frames
 topic_live = 'boom-logo/live'
@@ -32,8 +33,7 @@ topic_status = 'boom-logo/bridge/status'
 # End global settings
 
 start_address = int(os.environ.get('DMX_START_ADDRESS', '1'))
-control_fixture = os.environ.get('CONTROL_FIXTURE', 'false').lower() in ('1', 'true', 'yes')
-channel_count = fixture_count * fixture_channels + (4 if control_fixture else 0)
+channel_count = fixture_count * fixture_channels
 if start_address < 1 or start_address - 1 + channel_count > packet_size:
     raise ValueError(f"DMX_START_ADDRESS {start_address}: {channel_count} channels must fit in one universe")
 
@@ -66,10 +66,6 @@ frame_lock = threading.Lock()
 frame_changed = threading.Event()
 aurora_connected = False
 
-# Beat counter state: the counter goes up each time the beat channel rises past 128
-beat_counter = 0
-last_beat_channel = None
-
 # Logging variables to track the incoming packets
 last_log = time.monotonic()
 packets_since = 0
@@ -99,30 +95,28 @@ def parse_array(arr, desired_length):
 
 
 def build_frame(channels):
-    """The live frame for one DMX packet: R, G, B per segment times its dimmer, then the controls."""
-    global beat_counter, last_beat_channel
-
+    """The live frame for one DMX packet: R, G, B per segment times its dimmer, then the strobe byte."""
     base = start_address - 1
-    frame = bytearray()
+    colors = []
     strobing = False
     for n in range(fixture_count):
         r, g, b, _, dimmer, strobe = channels[base + n * fixture_channels:base + (n + 1) * fixture_channels]
-        color = bytes(min(255, int(c * dimmer / 255 + 0.5)) for c in (r, g, b))
-        frame += color * (tree_segments if n == fixture_count - 1 else 1)
+        colors.append(bytes(min(255, int(c * dimmer / 255 + 0.5)) for c in (r, g, b)))
         strobing = strobing or strobe == 255
-
-    if not control_fixture:
-        frame.append(255 if strobing else 0)
-        return bytes(frame)
-
-    variant, beat, texture, hit = channels[base + fixture_count * fixture_channels:base + channel_count]
-    frame.append((variant or 255) if strobing else 0)
-    # A counter instead of the channel itself, so a short beat survives the rate limit
-    if last_beat_channel is not None and last_beat_channel < 128 <= beat:
-        beat_counter = (beat_counter + 1) % 256
-    last_beat_channel = beat
-    frame += bytes((beat_counter, texture, hit))
+    # The tree sits in the middle of the grid but comes after the name in the frame
+    frame = bytearray(b''.join(colors[:tree_fixture] + colors[tree_fixture + 1:]) + colors[tree_fixture] * tree_segments)
+    frame.append(255 if strobing else 0)
     return bytes(frame)
+
+
+def format_channels(channels):
+    """The logo's channels for the debug log: RRGGBB/dimmer/strobe per fixture."""
+    base = start_address - 1
+    fixtures = []
+    for n in range(fixture_count):
+        r, g, b, _, dimmer, strobe = channels[base + n * fixture_channels:base + (n + 1) * fixture_channels]
+        fixtures.append(f"{r:02x}{g:02x}{b:02x}/{dimmer}/{strobe}")
+    return ' | '.join(fixtures)
 
 
 def set_frame(frame):
@@ -279,8 +273,11 @@ def main():
 def dmx_packet(packet):
     global packets_since, frames_since, last_log
 
-    set_frame(build_frame(parse_array(packet, packet_size)))
+    channels = parse_array(packet, packet_size)
+    set_frame(build_frame(channels))
     packets_since = packets_since + 1
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"DMX: {format_channels(channels)}")
 
     # Logging/debugging time
     now = time.monotonic()
